@@ -15,7 +15,7 @@ const GROUPS = [
 const LABELS = {
   prompt: "промпт", negative_prompt: "негатив", seed: "сид", steps: "шаги", cfg: "cfg",
   sampler_name: "сэмплер", scheduler: "расписание", shift_video: "shift видео", shift_audio: "shift аудио",
-  denoise: "denoise", num_windows: "окон", window_blocks: "длина окна (m)", overlap_blocks: "перекрытие (o)",
+  denoise: "denoise", num_windows: "окон", window_blocks: "длина окна (m)", overlap_blocks: "перекрытие (o)", window_mode: "режим окон",
   alternate_direction: "чередовать 1→N / N→1", temporal_guide: "guide от соседа", guide_from_step: "guide с шага",
   anchor_strength: "сила якоря", anchor_steps: "доля шагов с якорем", decode: "декодировать IMAGE", verbose: "подробный лог",
   preview_frames: "кадров (превью)",
@@ -145,12 +145,12 @@ function drawPanel(node, ctx, py, width) {
                      : "референсы: таблица <Picture N> появится после запуска";
   ctx.fillText(fit(ctx, rl, wd), x0, yEnd - 24);
   let s = "ожидание";
-  if (st.state === "run") s = `шаг ${st.step + 1}/${st.steps} · окно ${st.win + 1}${st.order.length ? " · " + (st.order[0] === 0 ? "1→N" : "N→1") : ""}${st.guide ? " · guide" : ""}${st.anchor > 0 ? " · якорь " + st.anchor.toFixed(2) : ""} · ${fmtT(st.elapsed)} · ETA ${fmtT(st.eta)}`;
+  if (st.state === "run") s = `шаг ${st.step + 1}/${st.steps} · окно ${st.win + 1}${st.seq ? " · посл." : (st.order.length ? " · " + (st.order[0] === 0 ? "1→N" : "N→1") : "")}${st.guide ? " · guide" : ""}${st.anchor > 0 ? " · якорь " + st.anchor.toFixed(2) : ""} · ${fmtT(st.elapsed)} · ETA ${fmtT(st.eta)}`;
   else if (st.state === "done") s = `готово за ${fmtT(st.elapsed)}`;
   ctx.fillStyle = st.state === "run" ? "#ffd166" : "#7f8fa6";
   ctx.fillText(fit(ctx, s, wd), x0, yEnd - 10);
   if (st.state === "run" && st.steps) {
-    const nw = Math.max(1, L.rows.length), f = Math.min(1, (st.step * nw + (st.pos || 0) + 1) / (st.steps * nw));
+    const nw = Math.max(1, L.rows.length), f = Math.min(1, (st.seq ? (st.win * st.steps + st.step + 1) : (st.step * nw + (st.pos || 0) + 1)) / (st.steps * nw));
     ctx.fillStyle = THEME.accent; ctx.fillRect(x0, yEnd - 5, wd * f, 2);
   }
   ctx.restore();
@@ -183,7 +183,7 @@ app.registerExtension({
           const st = node.h3wr;
           if (d.event === "refs") { st.refs = d.map || []; node.setDirtyCanvas?.(true, true); return; }
           if (d.event === "summary") setTimeout(() => recompute(node, false), 0);
-          if (d.event === "summary") Object.assign(st, { T: d.T, frames: d.frames, steps: d.steps, state: "run", step: 0, win: -1, pos: 0 });
+          if (d.event === "summary") Object.assign(st, { T: d.T, frames: d.frames, steps: d.steps, seq: !!d.seq, state: "run", step: 0, win: -1, pos: 0 });
           else if (d.event === "step") Object.assign(st, { state: "run", step: d.step, steps: d.steps, order: d.order, guide: d.guide, anchor: d.anchor });
           else if (d.event === "window") Object.assign(st, { state: "run", step: d.step, win: d.window, pos: d.pos, elapsed: d.elapsed, eta: d.eta });
           else if (d.event === "done") Object.assign(st, { state: "done", elapsed: d.total });

@@ -28,7 +28,10 @@ def _fmt_t(s):
 
 
 class Reporter:
-    def __init__(self, verbose=True, total_steps=1, num_windows=1, pbar=None, interrupt=None, cuda_peak=None, emit=None, notify=None):
+    def __init__(self, verbose=True, total_steps=1, num_windows=1, pbar=None, interrupt=None, cuda_peak=None, emit=None, notify=None, sequential=False):
+        self.sequential = sequential
+        self._seq_seen = set()
+        self._win_t0 = None
         self.verbose = verbose
         self.total_steps = max(1, total_steps)
         self.num_windows = max(1, num_windows)
@@ -61,7 +64,7 @@ class Reporter:
     def summary(self, video, audio, audio_src, wins, refs, steps, denoise, sigmas, cfg, sampler, scheduler,
                 shift, guide, anchor):
         T = video.shape[2]
-        self.send("summary", T=int(T), frames=int(frames_for_latent_t(T)), steps=int(steps),
+        self.send("summary", T=int(T), frames=int(frames_for_latent_t(T)), steps=int(steps), seq=bool(self.sequential),
                   windows=[[int(w.v0), int(w.v1)] for w in wins])
         if not self.verbose:
             return
@@ -71,7 +74,7 @@ class Reporter:
         L("MiniMax H3 Windowed Latent Refine")
         L(f"video latent {list(video.shape)}  audio latent {list(audio.shape)}  (audio from: {audio_src})")
         L(f"T={T} latent frames = {frames} px frames = {frames / 24:.2f}s @24fps, canvas {video.shape[4] * 16}x{video.shape[3] * 16}")
-        L(f"windows: {len(wins)}   refs: {refs}")
+        L(f"windows: {len(wins)}   refs: {refs}   mode: {'sequential (window by window)' if self.sequential else 'step-major (all windows every step)'}")
         L(f"  {'#':>2} | {'latent':>11} | {'len':>3} | {'px frames':>11} | {'audio':>11} | ovl prev")
         for i, w in enumerate(wins):
             ov = (wins[i - 1].v1 - w.v0) if i > 0 else 0
@@ -134,3 +137,40 @@ class Reporter:
                 pass
         self.send("done", total=time.perf_counter() - self.t0)
         self.log(f"finished in {_fmt_t(time.perf_counter() - self.t0)}{peak}")
+
+    # ---- sequential (window-major) mode
+    def seq_window_begin(self, wi, w, overlap, guides):
+        self.check_interrupt()
+        self._win_t0 = time.perf_counter()
+        self.log(f"window {wi + 1}/{self.num_windows} latent {w.v0}..{w.v1 - 1}: locked overlap {overlap} latent frame(s), "
+                 f"guides={guides}")
+
+    def seq_step(self, wi, step, sigma, anchor_k, tag):
+        self.check_interrupt()
+        key = (wi, step)
+        if key in self._seq_seen:
+            if self.verbose:
+                self.log(f"  step {step + 1}/{self.total_steps} extra model call ({tag})")
+            return
+        self._seq_seen.add(key)
+        el = time.perf_counter() - self.t0
+        done = wi * self.total_steps + step
+        total = self.total_steps * self.num_windows
+        eta = el / done * (total - done) if done else 0.0
+        self.send("step", step=int(step), steps=self.total_steps, sigma=float(sigma), order=[int(wi)], guide=wi > 0,
+                  anchor=float(anchor_k), seq=True)
+        self.send("window", step=int(step), steps=self.total_steps, pos=int(wi), window=int(wi), tag=tag, seq=True,
+                  elapsed=el, eta=eta)
+        if self.pbar is not None:
+            try:
+                self.pbar.update_absolute(min(total, done + 1), total)
+            except Exception:
+                pass
+        self.log(f"  window {wi + 1} step {step + 1}/{self.total_steps} sigma={sigma:.4f} anchor={anchor_k:.3f} [{tag}]")
+
+    def seq_window_done(self, wi, w):
+        dt = time.perf_counter() - (self._win_t0 or self.t0)
+        el = time.perf_counter() - self.t0
+        eta = el / (wi + 1) * (self.num_windows - wi - 1)
+        self.log(f"window {wi + 1}/{self.num_windows} done in {_fmt_t(dt)}; elapsed {_fmt_t(el)}, ETA {_fmt_t(eta)}")
+        self.check_interrupt()

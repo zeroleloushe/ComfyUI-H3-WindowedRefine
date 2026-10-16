@@ -2,7 +2,7 @@
 
 Нода ComfyUI **MiniMax H3 · Windowed Latent Refine** (`H3WindowedLatentRefine`, категория `MiniMax H3/Refine`). Она дорабатывает готовый AV-латент MiniMax H3 (Ref2VA) для длинных видео: делит его на перекрывающиеся окна и прогоняет за один проход сэмплера.
 
-> **English summary.** A ComfyUI node for MiniMax H3 (Ref2VA) that refines a long audio+video latent with overlapping temporal windows in a single sampler pass. Window order alternates (1→N / N→1), x0 is blended across overlaps, and each window can be guided by its neighbour's overlap (temporal guide via H3 keyframes) and optionally by an anchor latent. It takes character/location reference images, and a canvas preview on the node shows the window layout. Install: `git clone` into `ComfyUI/custom_nodes` and restart ComfyUI. No extra pip dependencies.
+> **English summary.** A ComfyUI node for MiniMax H3 (Ref2VA) that refines a long audio+video latent with overlapping temporal windows in a single sampler pass. Window order alternates (1→N / N→1), x0 is blended across overlaps, and each window can be guided by its neighbour's overlap (temporal guide via H3 keyframes) and optionally by an anchor latent. A `sequential` window mode runs window after window (all steps each), conditioning every next window on the finished overlap of the previous one (latent keyframes + locked x0), and `prev_clip` adds the last frame of a previous pass as a reference. It takes character/location reference images, and a canvas preview on the node shows the window layout. Install: `git clone` into `ComfyUI/custom_nodes` and restart ComfyUI. No extra pip dependencies.
 
 ![Нода в ComfyUI](docs/node.png)
 
@@ -13,6 +13,7 @@
 - **Temporal guide.** Окно получает перекрытие от уже обработанного соседа как keyframe H3. Начало задаёт `guide_from_step`.
 - **Якорь.** Для части шагов (`anchor_steps`) x0 подмешивается к якорю с силой `anchor_strength`. Якорь — это `anchor_latent` (или исходный латент).
 - **Референсы.** Входы `character_ref`, `location_ref`, `location_ref_2`, `location_ref_3`, `ref_4`–`ref_6` (до 9 картинок, батчи раскрываются). В промте на них ссылаются как `<Picture 1>`, `<Picture 2>`, …, нумерация идёт в порядке входов. Таблица соответствия выводится в лог и на ноду.
+- **Последовательный режим** (`window_mode = последовательный`): окна идут по очереди, каждое проходит все шаги целиком, и следующее окно продолжает уже готовый результат. Подробности ниже.
 - **Превью раскладки окон** прямо на ноде, с предупреждениями: число кадров не 17k+5; окно короче T=37 (124 кадра).
 - **Вход латента:** AV NestedTensor H3, словарь/кортеж `(video, audio)` или только видео (аудио тогда берётся из `anchor_latent` или создаётся пустое).
 
@@ -42,6 +43,7 @@ git clone https://github.com/zeroleloushe/ComfyUI-H3-WindowedRefine.git
 | num_windows | 2 | Число окон; 0 — размер окна задаёт `window_blocks` |
 | window_blocks (m) | 0 | Длина окна 5·m+2 латент-кадров (когда num_windows = 0) |
 | overlap_blocks (o) | 2 | Перекрытие 5·o+2 латент-кадров (1 → 7, 2 → 12) |
+| window_mode | по шагам | `по шагам` — все окна на каждом шаге (как раньше); `последовательный` — окно за окном |
 | alternate_direction | вкл | Чередовать порядок окон 1→N / N→1 |
 | temporal_guide | вкл | Подавать соседнее перекрытие как keyframe H3 |
 | guide_from_step | 1 | С какого шага (от 0) включается guide |
@@ -52,6 +54,22 @@ git clone https://github.com/zeroleloushe/ComfyUI-H3-WindowedRefine.git
 | preview_frames | 0 | Кадры для превью окон (только UI); 0 — взять из последнего запуска или 124 |
 
 Выходы: `latent` (AV-латент H3) и `images`.
+
+## Последовательный режим
+Включается параметром `window_mode = последовательный`. Режим по умолчанию (`по шагам`) работает как раньше.
+
+Как работает:
+1. Окно 1 проходит все шаги сэмплера целиком, потом окно 2, потом 3 и т.д. Шум и сид те же, что в обычном режиме (срез общего шума).
+2. Следующее окно получает **готовые латент-кадры из перекрытия** с предыдущим окном как keyframes H3 (кадры с индексом, кратным 5, на своих позициях). Это латенты, VAE не нужен, поэтому лишнего декодирования нет. Отключается `temporal_guide`.
+3. В зоне перекрытия x0 **зафиксирован** на готовом результате предыдущего окна (видео и аудио), поэтому перекрытие не перерисовывается, а склейка идёт без смешивания: перекрытие берётся из предыдущего окна, остальное — из нового.
+4. Вход `prev_clip` (IMAGE, необязательный) — готовый клип прошлого прохода, например предыдущего куска длинного ролика. Берётся его **последний кадр** и добавляется последним референсом `<Picture N>` (номер видно в таблице референсов на ноде и в логе). Упомяни его в промпте, например «продолжение сцены с <Picture 3>». Вход работает и в обычном режиме.
+
+Что меняется в параметрах:
+- `alternate_direction` и `guide_from_step` в этом режиме не используются (направление всегда 1→N, guide с первого шага).
+- Якорь работает в каждом окне отдельно: срез `anchor_latent` под окно, те же `anchor_strength` и `anchor_steps`.
+- Превью латентов в сэмплере в этом режиме не показывается, прогресс и ETA — на ноде и в логе.
+
+Когда использовать: если между окнами плывут или перерисовываются детали, лица, одежда; если нужно продолжить ролик от готового куска. Минусы: ошибки могут копиться к концу ролика, последнее окно «знает» только про соседа слева. Если нужен максимально ровный результат по всему ролику, оставь режим `по шагам`.
 
 ## Советы
 - Окна короче **T=37 (124 кадра)** выходят за обучающий диапазон H3, и превью предупредит об этом. Лучше брать меньше окон, но длиннее.

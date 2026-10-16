@@ -10,7 +10,8 @@ import comfy.utils
 import node_helpers
 
 from .h3_report import Reporter
-from .h3_windows import WindowedH3Wrapper, plan_windows, FRAME_PER_TOKEN, audio_len_for_frames
+from .h3_windows import (WindowedH3Wrapper, SequentialWindowWrapper, plan_windows, sequential_guide_indices,
+                         frames_for_latent_t, FRAME_PER_TOKEN, audio_len_for_frames)
 
 CANVAS_MULTIPLE = 32
 
@@ -21,7 +22,10 @@ def _resize(image, width, height):
 
 
 MAX_REF_IMAGES = 9  # comfy_extras MiniMaxH3ReferenceToVideo: ref_images Autogrow max=9
-REF_INPUTS = ["character_ref", "location_ref", "location_ref_2", "location_ref_3", "ref_4", "ref_5", "ref_6"]
+REF_INPUTS = ["character_ref", "location_ref", "location_ref_2", "location_ref_3", "ref_4", "ref_5", "ref_6", "prev_clip"]
+MODE_STEP = "по шагам"
+MODE_SEQ = "последовательный"
+WINDOW_MODES = [MODE_STEP, MODE_SEQ]
 
 
 def collect_refs(named):
@@ -196,7 +200,14 @@ def make_notifier(node_id):
 def run_windowed(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler, denoise,
                  num_windows, window_blocks, overlap_blocks, alternate, temporal_guide, guide_from_step,
                  anchor_latent=None, anchor_strength=0.0, anchor_steps_frac=0.0,
-                 shift_video=0.0, shift_audio=3.0, callback=None, log=None, verbose=True, audio_src="input", refs_count=0, emit=None, notify=None):
+                 shift_video=0.0, shift_audio=3.0, callback=None, log=None, verbose=True, audio_src="input", refs_count=0, emit=None, notify=None,
+                 window_mode=MODE_STEP):
+    if window_mode == MODE_SEQ:
+        return run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler, denoise,
+                              num_windows, window_blocks, overlap_blocks, temporal_guide, anchor_latent, anchor_strength,
+                              anchor_steps_frac, shift_video, shift_audio, log, verbose, audio_src, refs_count, emit, notify)
+    if window_mode != MODE_STEP:
+        raise ValueError(f"window_mode: unknown {window_mode!r}, expected one of {WINDOW_MODES}")
     video, audio, _ = split_av(latent, anchor_audio(anchor_latent))
     latent = to_av_latent(latent, video, audio)
     samples = latent["samples"]
@@ -241,12 +252,105 @@ def run_windowed(model, positive, negative, latent, seed, steps, cfg, sampler_na
     return res
 
 
+def run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler, denoise,
+                   num_windows, window_blocks, overlap_blocks, temporal_guide=True, anchor_latent=None, anchor_strength=0.0,
+                   anchor_steps_frac=0.0, shift_video=0.0, shift_audio=3.0, log=None, verbose=True, audio_src="input",
+                   refs_count=0, emit=None, notify=None):
+    """Window-major sampling: window 1 runs all steps, then window 2, ... Each next window gets the finished
+    overlap of the previous one as H3 keyframes (latent, no VAE) and its x0 in the overlap is locked to it."""
+    video, audio, _ = split_av(latent, anchor_audio(anchor_latent))
+    latent = to_av_latent(latent, video, audio)
+    samples = latent["samples"]
+    wins = plan_windows(video.shape[2], audio.shape[-1], num_windows, window_blocks, overlap_blocks)
+    if shift_video > 0:
+        model = apply_shift(model, shift_video, shift_audio)
+    anchor_full = make_anchor(video, anchor_latent) if anchor_strength > 0 else None
+    anchor_n = int(round(anchor_steps_frac * steps))
+    pbar = None
+    try:
+        pbar = comfy.utils.ProgressBar(steps * len(wins))
+    except Exception:
+        pass
+    cuda_peak = None
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.reset_peak_memory_stats()
+            cuda_peak = torch.cuda.max_memory_allocated
+        except Exception:
+            pass
+    rep = Reporter(verbose, steps, len(wins), pbar, comfy.model_management.throw_exception_if_processing_interrupted,
+                   cuda_peak, emit, notify, sequential=True)
+    try:
+        ks = comfy.samplers.KSampler(model, steps=steps, device="cpu", sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options)
+        sig = ks.sigmas.tolist()
+    except Exception:
+        sig = []
+    rep.summary(video, audio, audio_src, wins, refs_count, steps, denoise, sig, cfg, sampler_name, scheduler,
+                f"{shift_video}/{shift_audio}" if shift_video > 0 else "model default",
+                f"sequential: finished overlap of previous window -> keyframes {'on' if temporal_guide else 'off'}, x0 locked in overlap",
+                f"strength {anchor_strength}, {anchor_n} step(s) per window, source {'anchor_latent' if anchor_latent is not None else 'input latent'}")
+    noise = comfy.sample.prepare_noise(samples, seed)
+    nv, na = noise.unbind()
+    out_v, out_a = video.clone(), audio.clone()
+    for wi, w in enumerate(wins):
+        prev = wins[wi - 1] if wi > 0 else None
+        Tw, Aw = w.v1 - w.v0, w.a1 - w.a0
+        sub_v = video[:, :, w.v0:w.v1].clone()
+        sub_a = audio[..., w.a0:w.a1].clone()
+        kfs, lock_v, lock_wv, lock_a, lock_wa = [], None, None, None, None
+        ov_v = ov_a = 0
+        if prev is not None:
+            ov_v = max(0, min(prev.v1, w.v1) - w.v0)
+            ov_a = max(0, min(prev.a1, w.a1) - w.a0)
+            if ov_v:
+                sub_v[:, :, :ov_v] = out_v[:, :, w.v0:w.v0 + ov_v]
+                lock_v = sub_v.clone()
+                lock_wv = torch.zeros(Tw)
+                lock_wv[:ov_v] = 1.0
+            if ov_a:
+                sub_a[..., :ov_a] = out_a[..., w.a0:w.a0 + ov_a]
+                lock_a = sub_a.clone()
+                lock_wa = torch.zeros(Aw)
+                lock_wa[:ov_a] = 1.0
+            if temporal_guide:
+                for gi in sequential_guide_indices(w, prev, count=Tw):
+                    kfs.append({"resolved_frame_index": frames_for_latent_t(gi - w.v0),
+                                "latent": out_v[:, :, gi:gi + 1].clone()})
+        guides = [k["resolved_frame_index"] for k in kfs]
+        if log is not None:
+            log.append(("window", wi, tuple(guides)))
+        rep.seq_window_begin(wi, w, ov_v, guides)
+
+        def on_step(step, sigma, k, tag, _wi=wi):
+            if log is not None:
+                log.append((step, (_wi,)))
+            rep.seq_step(_wi, step, sigma, k, tag)
+
+        wrapper = SequentialWindowWrapper(kfs, lock_v, lock_wv, lock_a, lock_wa,
+                                          anchor_full[:, :, w.v0:w.v1] if anchor_full is not None else None,
+                                          anchor_strength, anchor_n, on_step)
+        m = model.clone()
+        m.set_model_unet_function_wrapper(wrapper)
+        sub = comfy.nested_tensor.NestedTensor((sub_v, sub_a))
+        sub_noise = comfy.nested_tensor.NestedTensor((nv[:, :, w.v0:w.v1], na[..., w.a0:w.a1]))
+        res = comfy.sample.sample(m, sub_noise, steps, cfg, sampler_name, scheduler, positive, negative, sub,
+                                  denoise=denoise, disable_pbar=True, seed=seed)
+        rv, ra = res.unbind()
+        out_v[:, :, w.v0 + ov_v:w.v1] = rv[:, :, ov_v:].to(out_v.dtype)
+        out_a[..., w.a0 + ov_a:w.a1] = ra[..., ov_a:].to(out_a.dtype)
+        rep.seq_window_done(wi, w)
+    rep.finish()
+    res = latent.copy()
+    res["samples"] = comfy.nested_tensor.NestedTensor((out_v, out_a))
+    return res
+
+
 class H3WindowedLatentRefine:
     """Group order matters: the web extension draws section headers from WIDGET_GROUPS."""
     WIDGET_GROUPS = [
         ("Вход", ["prompt", "negative_prompt", "seed", "steps", "cfg", "sampler_name", "scheduler",
                   "shift_video", "shift_audio", "denoise"]),
-        ("Окна", ["num_windows", "window_blocks", "overlap_blocks"]),
+        ("Окна", ["num_windows", "window_blocks", "overlap_blocks", "window_mode"]),
         ("Согласованность", ["alternate_direction", "temporal_guide", "guide_from_step"]),
         ("Якорь", ["anchor_strength", "anchor_steps"]),
         ("Выход", ["decode", "verbose"]),
@@ -278,6 +382,7 @@ class H3WindowedLatentRefine:
                 "num_windows": ("INT", {"default": 2, "min": 0, "max": 64, "tooltip": "Число временных окон. 0 — длину задаёт «Длина окна»."}),
                 "window_blocks": ("INT", {"default": 0, "min": 0, "max": 200, "tooltip": "m: длина окна 5·m+2 латент-кадров (используется, если окон = 0)."}),
                 "overlap_blocks": ("INT", {"default": 2, "min": 0, "max": 100, "tooltip": "o: перекрытие не меньше 5·o+2 латент-кадров (1 → 7, 2 → 12)."}),
+                "window_mode": (WINDOW_MODES, {"default": MODE_STEP, "tooltip": "«по шагам» — на каждом шаге сэмплера обходятся все окна (как раньше). «последовательный» — окно 1 проходит все шаги, потом окно 2 и т.д.: следующее окно получает готовое перекрытие предыдущего как keyframes H3 и фиксирует его (x0 в перекрытии = готовый результат). В этом режиме «чередовать» и «guide с шага» не используются."}),
                 # --- согласованность
                 "alternate_direction": ("BOOLEAN", {"default": True, "tooltip": "Чередовать порядок окон по шагам: 1→N, затем N→1."}),
                 "temporal_guide": ("BOOLEAN", {"default": True, "tooltip": "Передавать окну кадр соседа из зоны перекрытия как keyframe H3."}),
@@ -300,6 +405,7 @@ class H3WindowedLatentRefine:
                 "ref_4": ("IMAGE", {"tooltip": "Любой доп. референс (предмет, стиль…), батч допустим."}),
                 "ref_5": ("IMAGE", {"tooltip": "Любой доп. референс, батч допустим."}),
                 "ref_6": ("IMAGE", {"tooltip": "Любой доп. референс, батч допустим. Всего не больше 9 картинок."}),
+                "prev_clip": ("IMAGE", {"tooltip": "Готовый клип прошлого прохода (например, предыдущего куска ролика). Берётся последний кадр и добавляется последним референсом <Picture N> (номер — в таблице референсов). Работает в обоих режимах; в последовательном это главный способ задать старт первому окну."}),
                 "anchor_latent": ("LATENT", {"tooltip": "Исходный низкоразрешённый латент H3: якорь и источник аудио."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -307,7 +413,7 @@ class H3WindowedLatentRefine:
 
     RETURN_NAMES = ("latent", "images")
     OUTPUT_TOOLTIPS = ("AV-латент H3 (видео + аудио).", "Декодированные кадры (если decode включён).")
-    DESCRIPTION = "Апскейл-рефайн латента MiniMax H3 перекрывающимися временными окнами, которые идут через сэмплер синхронно, шаг за шагом."
+    DESCRIPTION = "Апскейл-рефайн латента MiniMax H3 перекрывающимися временными окнами, которые идут через сэмплер синхронно, шаг за шагом (по умолчанию), или по очереди — окно за окном (режим «последовательный»)."
     RETURN_TYPES = ("LATENT", "IMAGE")
     FUNCTION = "run"
     CATEGORY = "MiniMax H3/Refine"
@@ -316,7 +422,8 @@ class H3WindowedLatentRefine:
             shift_video, shift_audio, denoise, num_windows, window_blocks, overlap_blocks, alternate_direction,
             temporal_guide, guide_from_step, anchor_strength, anchor_steps, decode, verbose=True,
             character_ref=None, location_ref=None, anchor_latent=None, unique_id=None,
-            location_ref_2=None, location_ref_3=None, ref_4=None, ref_5=None, ref_6=None, preview_frames=0):
+            location_ref_2=None, location_ref_3=None, ref_4=None, ref_5=None, ref_6=None, preview_frames=0,
+            window_mode=MODE_STEP, prev_clip=None):
         del preview_frames  # UI-only
         import latent_preview
         video, audio, src = split_av(latent, anchor_audio(anchor_latent))
@@ -328,7 +435,8 @@ class H3WindowedLatentRefine:
         width, height = video.shape[4] * 16, video.shape[3] * 16
         refs, mapping = collect_refs({"character_ref": character_ref, "location_ref": location_ref,
                                       "location_ref_2": location_ref_2, "location_ref_3": location_ref_3,
-                                      "ref_4": ref_4, "ref_5": ref_5, "ref_6": ref_6})
+                                      "ref_4": ref_4, "ref_5": ref_5, "ref_6": ref_6,
+                                      "prev_clip": prev_clip[-1:] if prev_clip is not None else None})
         notify = make_notifier(unique_id)
         lines = mapping_lines(mapping)
         if verbose:
@@ -344,7 +452,7 @@ class H3WindowedLatentRefine:
                            num_windows, window_blocks, overlap_blocks, alternate_direction, temporal_guide, guide_from_step,
                            anchor_latent, anchor_strength, anchor_steps, shift_video, shift_audio, callback=cb,
                            verbose=verbose, audio_src=src, refs_count=len(refs),
-                           notify=notify)
+                           notify=notify, window_mode=window_mode)
         if decode:
             v = out["samples"].tensors[0] if getattr(out["samples"], "is_nested", False) else out["samples"]
             img = vae.decode(v)

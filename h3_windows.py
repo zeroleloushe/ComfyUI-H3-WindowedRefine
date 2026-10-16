@@ -260,3 +260,64 @@ class WindowedH3Wrapper:
             anc = self.anchor_video.to(out_v.device, out_v.dtype)
             out_v = torch.lerp(out_v, anc, k)
         return pack(out_v.to(x.dtype), out_a.to(x.dtype))[0]
+
+
+def sequential_guide_indices(win, prev, count=1):
+    """Sequential mode: global latent indices (multiples of 5) in the overlap with the finished previous
+    window, the latest ones first (closest to the part of the window that is still unknown)."""
+    lo, hi = max(win.v0, prev.v0), min(win.v1, prev.v1)
+    idx = [i for i in range(lo, hi) if i % 5 == 0]
+    return sorted(idx[::-1][:max(0, count)])
+
+
+class SequentialWindowWrapper:
+    """model_function_wrapper for window-major ("sequential") sampling of ONE window.
+
+    The sampler runs on the window's own sub-latent. Every model call:
+    - adds `keyframes` (finished latent frames of the previous window, window coordinates) to the H3 payload;
+    - replaces the predicted x0 inside the overlap with the finished previous window (`lock_*`, `lock_w*`),
+      so the sampler converges exactly to the already finished frames there;
+    - optionally lerps the rest towards an anchor slice (same decay as the step-major mode)."""
+
+    def __init__(self, keyframes=None, lock_video=None, lock_wv=None, lock_audio=None, lock_wa=None,
+                 anchor_video=None, anchor_strength=0.0, anchor_steps=0, on_step=None):
+        self.keyframes = list(keyframes or [])
+        self.lock_video, self.lock_wv = lock_video, lock_wv
+        self.lock_audio, self.lock_wa = lock_audio, lock_wa
+        self.anchor_video = anchor_video
+        self.anchor_strength = anchor_strength
+        self.anchor_steps = anchor_steps
+        self.on_step = on_step
+
+    def anchor_k(self, step):
+        if self.anchor_video is None or self.anchor_strength <= 0 or step >= self.anchor_steps:
+            return 0.0
+        return self.anchor_strength * (1.0 - step / max(1, self.anchor_steps))
+
+    def __call__(self, apply_model, args):
+        x, t, c = args["input"], args["timestep"], dict(args["c"])
+        shapes = c.get("latent_shapes")
+        payload = c.get("minimax_payload")
+        if shapes is None or len(shapes) != 2 or payload is None:
+            return apply_model(x, t, **c)
+        step = WindowedH3Wrapper.step_index(t, c.get("transformer_options", {}))
+        tag = "/".join("cond" if v == 0 else "uncond" for v in args.get("cond_or_uncond", [])) or "cond"
+        k = self.anchor_k(step)
+        if self.on_step is not None:
+            self.on_step(step, float(t.flatten()[0]), k, tag)
+        if self.keyframes:
+            T = shapes[0][2]
+            A = shapes[1][-1]
+            c["minimax_payload"] = build_window_payload(payload, Window(0, T, 0, A), self.keyframes)
+        out = apply_model(x, t, **c)
+        ov, oa = unpack(out, shapes)
+        ov, oa = ov.float(), oa.float()
+        if k > 0:
+            ov = torch.lerp(ov, self.anchor_video.to(ov.device, ov.dtype), k)
+        if self.lock_video is not None:
+            w = self.lock_wv.to(ov.device).view(1, 1, -1, 1, 1)
+            ov = ov * (1 - w) + self.lock_video.to(ov.device, ov.dtype) * w
+        if self.lock_audio is not None:
+            w = self.lock_wa.to(oa.device)
+            oa = oa * (1 - w) + self.lock_audio.to(oa.device, oa.dtype) * w
+        return pack(ov.to(x.dtype), oa.to(x.dtype))[0]
