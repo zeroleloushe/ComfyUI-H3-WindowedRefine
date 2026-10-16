@@ -2,6 +2,7 @@
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pytest
 import torch
 
 import comfy.sample
@@ -102,7 +103,38 @@ def test_default_mode_unchanged(patcher):
         assert torch.equal(x, y)
 
 
-def test_prev_clip_is_last_reference():
-    from h3wr.nodes import collect_refs, mapping_lines
-    imgs, mapping = collect_refs({"character_ref": torch.zeros(1, 8, 8, 3), "prev_clip": torch.zeros(1, 8, 8, 3)})
-    assert mapping_lines(mapping)[-1] == "<Picture 2> = prev_clip"
+def test_seq_prompt_and_last_frame():
+    from h3wr.nodes import seq_prompt, last_frame_image, DEFAULT_SEQ_PHRASE
+    assert seq_prompt("a cat", "see <Picture {n}>", 3) == "a cat\nsee <Picture 3>"
+    assert seq_prompt("a cat", "", 2) == "a cat\n<Picture 2>"
+    assert "<Picture 4>" in seq_prompt("x", DEFAULT_SEQ_PHRASE, 4)
+    seen = {}
+
+    class VAE:
+        def decode(self, v):
+            seen["T"] = (v.shape[2], float(v[0, 0, 0, 0, 0]))
+            n = 1 + 4 * (v.shape[2] - 1)
+            return torch.arange(n, dtype=torch.float32).view(1, n, 1, 1, 1).expand(1, n, 2, 2, 3)
+
+    video = torch.arange(37, dtype=torch.float32).view(1, 1, 37, 1, 1).expand(1, 24, 37, 2, 2).contiguous()
+    img = last_frame_image(VAE(), video, Window(0, 22, 0, 0))
+    assert seen["T"] == (2, 20.0) and img.shape == (1, 2, 2, 3) and float(img[0, 0, 0, 0]) == 4
+
+
+@pytest.mark.parametrize("lock", [True, False])
+def test_sequential_reencodes_each_window(patcher, lock):
+    lat = {"samples": av_latent(124)}
+    pos, neg = conds()
+    calls = []
+
+    def window_conds(wi, finished, prev):
+        calls.append((wi, prev is not None, finished.shape))
+        if prev is None:
+            return None
+        return conds()
+
+    log = []
+    out = run_windowed(patcher, pos, neg, lat, 0, 2, 1.0, "euler", "simple", 0.5, 3, 0, 1, True, True, 1,
+                       verbose=False, log=log, window_mode=MODE_SEQ, window_conds=window_conds, seq_lock_overlap=lock)
+    assert [c[:2] for c in calls] == [(0, False), (1, True), (2, True)]
+    assert torch.isfinite(out["samples"].unbind()[0]).all()

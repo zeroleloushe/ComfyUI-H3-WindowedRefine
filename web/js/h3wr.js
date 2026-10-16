@@ -15,7 +15,7 @@ const GROUPS = [
 const LABELS = {
   prompt: "промпт", negative_prompt: "негатив", seed: "сид", steps: "шаги", cfg: "cfg",
   sampler_name: "сэмплер", scheduler: "расписание", shift_video: "shift видео", shift_audio: "shift аудио",
-  denoise: "denoise", num_windows: "окон", window_blocks: "длина окна (m)", overlap_blocks: "перекрытие (o)", window_mode: "режим окон",
+  denoise: "denoise", num_windows: "окон", window_blocks: "длина окна (m)", overlap_blocks: "перекрытие (o)", window_mode: "режим окон", seq_lock_overlap: "фикс. перекрытие (посл.)", seq_ref_phrase: "фраза-продолжение (посл.)",
   alternate_direction: "чередовать 1→N / N→1", temporal_guide: "guide от соседа", guide_from_step: "guide с шага",
   anchor_strength: "сила якоря", anchor_steps: "доля шагов с якорем", decode: "декодировать IMAGE", verbose: "подробный лог",
   preview_frames: "кадров (превью)",

@@ -2,7 +2,7 @@
 
 Нода ComfyUI **MiniMax H3 · Windowed Latent Refine** (`H3WindowedLatentRefine`, категория `MiniMax H3/Refine`). Она дорабатывает готовый AV-латент MiniMax H3 (Ref2VA) для длинных видео: делит его на перекрывающиеся окна и прогоняет за один проход сэмплера.
 
-> **English summary.** A ComfyUI node for MiniMax H3 (Ref2VA) that refines a long audio+video latent with overlapping temporal windows in a single sampler pass. Window order alternates (1→N / N→1), x0 is blended across overlaps, and each window can be guided by its neighbour's overlap (temporal guide via H3 keyframes) and optionally by an anchor latent. A `sequential` window mode runs window after window (all steps each), conditioning every next window on the finished overlap of the previous one (latent keyframes + locked x0), and `prev_clip` adds the last frame of a previous pass as a reference. It takes character/location reference images, and a canvas preview on the node shows the window layout. Install: `git clone` into `ComfyUI/custom_nodes` and restart ComfyUI. No extra pip dependencies.
+> **English summary.** A ComfyUI node for MiniMax H3 (Ref2VA) that refines a long audio+video latent with overlapping temporal windows in a single sampler pass. Window order alternates (1→N / N→1), x0 is blended across overlaps, and each window can be guided by its neighbour's overlap (temporal guide via H3 keyframes) and optionally by an anchor latent. A `sequential` window mode runs window after window (all steps each), conditioning every next window on the finished overlap of the previous one (latent keyframes + locked x0), re-encoding the prompt for every next window with the main refs plus the previous window's last decoded frame as an extra `<Picture N>`; window 1 can use a ready `positive` conditioning. It takes character/location reference images, and a canvas preview on the node shows the window layout. Install: `git clone` into `ComfyUI/custom_nodes` and restart ComfyUI. No extra pip dependencies.
 
 ![Нода в ComfyUI](docs/node.png)
 
@@ -44,6 +44,8 @@ git clone https://github.com/zeroleloushe/ComfyUI-H3-WindowedRefine.git
 | window_blocks (m) | 0 | Длина окна 5·m+2 латент-кадров (когда num_windows = 0) |
 | overlap_blocks (o) | 2 | Перекрытие 5·o+2 латент-кадров (1 → 7, 2 → 12) |
 | window_mode | по шагам | `по шагам` — все окна на каждом шаге (как раньше); `последовательный` — окно за окном |
+| seq_lock_overlap | вкл | Посл. режим: зафиксировать перекрытие на готовом предыдущем окне |
+| seq_ref_phrase | (см. ниже) | Посл. режим: фраза для окон 2+, `{n}` — номер кадра-референса |
 | alternate_direction | вкл | Чередовать порядок окон 1→N / N→1 |
 | temporal_guide | вкл | Подавать соседнее перекрытие как keyframe H3 |
 | guide_from_step | 1 | С какого шага (от 0) включается guide |
@@ -59,17 +61,22 @@ git clone https://github.com/zeroleloushe/ComfyUI-H3-WindowedRefine.git
 Включается параметром `window_mode = последовательный`. Режим по умолчанию (`по шагам`) работает как раньше.
 
 Как работает:
-1. Окно 1 проходит все шаги сэмплера целиком, потом окно 2, потом 3 и т.д. Шум и сид те же, что в обычном режиме (срез общего шума).
-2. Следующее окно получает **готовые латент-кадры из перекрытия** с предыдущим окном как keyframes H3 (кадры с индексом, кратным 5, на своих позициях). Это латенты, VAE не нужен, поэтому лишнего декодирования нет. Отключается `temporal_guide`.
-3. В зоне перекрытия x0 **зафиксирован** на готовом результате предыдущего окна (видео и аудио), поэтому перекрытие не перерисовывается, а склейка идёт без смешивания: перекрытие берётся из предыдущего окна, остальное — из нового.
-4. Вход `prev_clip` (IMAGE, необязательный) — готовый клип прошлого прохода, например предыдущего куска длинного ролика. Берётся его **последний кадр** и добавляется последним референсом `<Picture N>` (номер видно в таблице референсов на ноде и в логе). Упомяни его в промпте, например «продолжение сцены с <Picture 3>». Вход работает и в обычном режиме.
+1. Окна идут по очереди: окно 1 проходит все шаги сэмплера целиком, потом окно 2 и т.д. Шум и сид те же, что в обычном режиме (срез общего шума).
+2. **Окно 1** берёт готовый `positive` прошлой генерации, если он подключён к входу `positive` (CONDITIONING), как есть. Если вход пустой — кодируется промпт ноды с основными референсами.
+3. **Каждое следующее окно кодирует кондишн заново**: промпт ноды + основные референсы + **последний кадр готового предыдущего окна** как новый `<Picture N>` (N = число основных картинок + 1). Кадр декодируется через VAE (декодируется только хвост окна, 2 латент-кадра). К промпту новой строкой дописывается фраза из `seq_ref_phrase`, `{n}` заменяется на N. По умолчанию:
+   `Continuity: <Picture {n}> is the last frame of the previous segment of this video; continue from it and keep characters, faces, clothing, lighting and details consistent with <Picture {n}>.`
+   Пустая фраза — дописывается просто `<Picture N>`. Негатив тоже кодируется с этим же набором референсов.
+4. Готовые латент-кадры из перекрытия передаются следующему окну как keyframes H3 (отключается `temporal_guide`).
+5. `seq_lock_overlap` (вкл по умолчанию): перекрытие зафиксировано на готовом предыдущем окне и не перерисовывается. Выкл — перекрытие перерисовывается, в итог идёт новая версия.
+
+Подключение: `positive` — выход positive от ноды кодирования прошлой генерации (тот, что шёл в сэмплер первого прохода); `latent` — апскейленный латент; `anchor_latent` — исходный, как и раньше. Основных референсов не больше 8 (девятый слот занимает кадр предыдущего окна).
 
 Что меняется в параметрах:
-- `alternate_direction` и `guide_from_step` в этом режиме не используются (направление всегда 1→N, guide с первого шага).
-- Якорь работает в каждом окне отдельно: срез `anchor_latent` под окно, те же `anchor_strength` и `anchor_steps`.
-- Превью латентов в сэмплере в этом режиме не показывается, прогресс и ETA — на ноде и в логе.
+- `alternate_direction` и `guide_from_step` в этом режиме не используются.
+- Якорь работает в каждом окне отдельно (срез `anchor_latent` под окно).
+- Превью латентов в сэмплере не показывается; прогресс и ETA — на ноде и в логе. Текущее `<Picture N>` для окна видно в таблице референсов.
 
-Когда использовать: если между окнами плывут или перерисовываются детали, лица, одежда; если нужно продолжить ролик от готового куска. Минусы: ошибки могут копиться к концу ролика, последнее окно «знает» только про соседа слева. Если нужен максимально ровный результат по всему ролику, оставь режим `по шагам`.
+Когда использовать: если между окнами плывут или перерисовываются детали, лица, одежда. Минусы: дольше (кодирование промпта и декод кадра на каждое окно), ошибки могут копиться к концу ролика.
 
 ## Советы
 - Окна короче **T=37 (124 кадра)** выходят за обучающий диапазон H3, и превью предупредит об этом. Лучше брать меньше окон, но длиннее.

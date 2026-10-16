@@ -22,10 +22,30 @@ def _resize(image, width, height):
 
 
 MAX_REF_IMAGES = 9  # comfy_extras MiniMaxH3ReferenceToVideo: ref_images Autogrow max=9
-REF_INPUTS = ["character_ref", "location_ref", "location_ref_2", "location_ref_3", "ref_4", "ref_5", "ref_6", "prev_clip"]
+REF_INPUTS = ["character_ref", "location_ref", "location_ref_2", "location_ref_3", "ref_4", "ref_5", "ref_6", "prev_window_frame"]
 MODE_STEP = "по шагам"
 MODE_SEQ = "последовательный"
 WINDOW_MODES = [MODE_STEP, MODE_SEQ]
+DEFAULT_SEQ_PHRASE = ("Continuity: <Picture {n}> is the last frame of the previous segment of this video; "
+                      "continue from it and keep characters, faces, clothing, lighting and details consistent with <Picture {n}>.")
+
+
+def seq_prompt(prompt, phrase, n):
+    """Prompt for sequential window k>=2: user prompt + continuation phrase ({n} -> picture number)."""
+    phrase = (phrase or "").strip()
+    if not phrase:
+        phrase = "<Picture {n}>"
+    tail = phrase.replace("{n}", str(n))
+    return (prompt.rstrip() + "\n" + tail) if prompt.strip() else tail
+
+
+def last_frame_image(vae, video, win):
+    """Decode the tail of a finished window (from its last standalone latent frame 5j) and return
+    the last pixel frame as IMAGE [1,H,W,3]."""
+    s = ((win.v1 - 1) // 5) * 5
+    img = vae.decode(video[:1, :, s:win.v1])
+    img = img.reshape((-1,) + tuple(img.shape[-3:]))
+    return img[-1:, ..., :3]
 
 
 def collect_refs(named):
@@ -201,11 +221,12 @@ def run_windowed(model, positive, negative, latent, seed, steps, cfg, sampler_na
                  num_windows, window_blocks, overlap_blocks, alternate, temporal_guide, guide_from_step,
                  anchor_latent=None, anchor_strength=0.0, anchor_steps_frac=0.0,
                  shift_video=0.0, shift_audio=3.0, callback=None, log=None, verbose=True, audio_src="input", refs_count=0, emit=None, notify=None,
-                 window_mode=MODE_STEP):
+                 window_mode=MODE_STEP, window_conds=None, seq_lock_overlap=True):
     if window_mode == MODE_SEQ:
         return run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler, denoise,
                               num_windows, window_blocks, overlap_blocks, temporal_guide, anchor_latent, anchor_strength,
-                              anchor_steps_frac, shift_video, shift_audio, log, verbose, audio_src, refs_count, emit, notify)
+                              anchor_steps_frac, shift_video, shift_audio, log, verbose, audio_src, refs_count, emit, notify,
+                              window_conds, seq_lock_overlap)
     if window_mode != MODE_STEP:
         raise ValueError(f"window_mode: unknown {window_mode!r}, expected one of {WINDOW_MODES}")
     video, audio, _ = split_av(latent, anchor_audio(anchor_latent))
@@ -255,9 +276,11 @@ def run_windowed(model, positive, negative, latent, seed, steps, cfg, sampler_na
 def run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler, denoise,
                    num_windows, window_blocks, overlap_blocks, temporal_guide=True, anchor_latent=None, anchor_strength=0.0,
                    anchor_steps_frac=0.0, shift_video=0.0, shift_audio=3.0, log=None, verbose=True, audio_src="input",
-                   refs_count=0, emit=None, notify=None):
+                   refs_count=0, emit=None, notify=None, window_conds=None, seq_lock_overlap=True):
     """Window-major sampling: window 1 runs all steps, then window 2, ... Each next window gets the finished
-    overlap of the previous one as H3 keyframes (latent, no VAE) and its x0 in the overlap is locked to it."""
+    overlap of the previous one as H3 keyframes (latent, no VAE) and (seq_lock_overlap) its x0 in the overlap is locked.
+    window_conds(wi, finished_video, prev_window) -> (positive, negative) or None re-encodes conditioning per window
+    (window 1 gets prev_window=None)."""
     video, audio, _ = split_av(latent, anchor_audio(anchor_latent))
     latent = to_av_latent(latent, video, audio)
     samples = latent["samples"]
@@ -287,7 +310,7 @@ def run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_
         sig = []
     rep.summary(video, audio, audio_src, wins, refs_count, steps, denoise, sig, cfg, sampler_name, scheduler,
                 f"{shift_video}/{shift_audio}" if shift_video > 0 else "model default",
-                f"sequential: finished overlap of previous window -> keyframes {'on' if temporal_guide else 'off'}, x0 locked in overlap",
+                f"sequential: per-window re-encode {'on' if window_conds else 'off'}, overlap keyframes {'on' if temporal_guide else 'off'}, overlap lock {'on' if seq_lock_overlap else 'off'}",
                 f"strength {anchor_strength}, {anchor_n} step(s) per window, source {'anchor_latent' if anchor_latent is not None else 'input latent'}")
     noise = comfy.sample.prepare_noise(samples, seed)
     nv, na = noise.unbind()
@@ -302,12 +325,12 @@ def run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_
         if prev is not None:
             ov_v = max(0, min(prev.v1, w.v1) - w.v0)
             ov_a = max(0, min(prev.a1, w.a1) - w.a0)
-            if ov_v:
+            if ov_v and seq_lock_overlap:
                 sub_v[:, :, :ov_v] = out_v[:, :, w.v0:w.v0 + ov_v]
                 lock_v = sub_v.clone()
                 lock_wv = torch.zeros(Tw)
                 lock_wv[:ov_v] = 1.0
-            if ov_a:
+            if ov_a and seq_lock_overlap:
                 sub_a[..., :ov_a] = out_a[..., w.a0:w.a0 + ov_a]
                 lock_a = sub_a.clone()
                 lock_wa = torch.zeros(Aw)
@@ -316,6 +339,13 @@ def run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_
                 for gi in sequential_guide_indices(w, prev, count=Tw):
                     kfs.append({"resolved_frame_index": frames_for_latent_t(gi - w.v0),
                                 "latent": out_v[:, :, gi:gi + 1].clone()})
+        if not seq_lock_overlap:
+            ov_v = ov_a = 0
+        pos_w, neg_w = positive, negative
+        if window_conds is not None:
+            r = window_conds(wi, out_v, prev)
+            if r is not None:
+                pos_w, neg_w = r
         guides = [k["resolved_frame_index"] for k in kfs]
         if log is not None:
             log.append(("window", wi, tuple(guides)))
@@ -333,7 +363,7 @@ def run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_
         m.set_model_unet_function_wrapper(wrapper)
         sub = comfy.nested_tensor.NestedTensor((sub_v, sub_a))
         sub_noise = comfy.nested_tensor.NestedTensor((nv[:, :, w.v0:w.v1], na[..., w.a0:w.a1]))
-        res = comfy.sample.sample(m, sub_noise, steps, cfg, sampler_name, scheduler, positive, negative, sub,
+        res = comfy.sample.sample(m, sub_noise, steps, cfg, sampler_name, scheduler, pos_w, neg_w, sub,
                                   denoise=denoise, disable_pbar=True, seed=seed)
         rv, ra = res.unbind()
         out_v[:, :, w.v0 + ov_v:w.v1] = rv[:, :, ov_v:].to(out_v.dtype)
@@ -350,7 +380,7 @@ class H3WindowedLatentRefine:
     WIDGET_GROUPS = [
         ("Вход", ["prompt", "negative_prompt", "seed", "steps", "cfg", "sampler_name", "scheduler",
                   "shift_video", "shift_audio", "denoise"]),
-        ("Окна", ["num_windows", "window_blocks", "overlap_blocks", "window_mode"]),
+        ("Окна", ["num_windows", "window_blocks", "overlap_blocks", "window_mode", "seq_lock_overlap", "seq_ref_phrase"]),
         ("Согласованность", ["alternate_direction", "temporal_guide", "guide_from_step"]),
         ("Якорь", ["anchor_strength", "anchor_steps"]),
         ("Выход", ["decode", "verbose"]),
@@ -382,7 +412,9 @@ class H3WindowedLatentRefine:
                 "num_windows": ("INT", {"default": 2, "min": 0, "max": 64, "tooltip": "Число временных окон. 0 — длину задаёт «Длина окна»."}),
                 "window_blocks": ("INT", {"default": 0, "min": 0, "max": 200, "tooltip": "m: длина окна 5·m+2 латент-кадров (используется, если окон = 0)."}),
                 "overlap_blocks": ("INT", {"default": 2, "min": 0, "max": 100, "tooltip": "o: перекрытие не меньше 5·o+2 латент-кадров (1 → 7, 2 → 12)."}),
-                "window_mode": (WINDOW_MODES, {"default": MODE_STEP, "tooltip": "«по шагам» — на каждом шаге сэмплера обходятся все окна (как раньше). «последовательный» — окно 1 проходит все шаги, потом окно 2 и т.д.: следующее окно получает готовое перекрытие предыдущего как keyframes H3 и фиксирует его (x0 в перекрытии = готовый результат). В этом режиме «чередовать» и «guide с шага» не используются."}),
+                "window_mode": (WINDOW_MODES, {"default": MODE_STEP, "tooltip": "«по шагам» — на каждом шаге сэмплера обходятся все окна (как раньше). «последовательный» — окно 1 проходит все шаги, потом окно 2 и т.д. Окно 1 берёт готовый positive (вход positive) или промпт; каждое следующее окно заново кодирует промпт с основными референсами + последним кадром готового предыдущего окна как новым <Picture N>. «чередовать» и «guide с шага» здесь не используются."}),
+                "seq_lock_overlap": ("BOOLEAN", {"default": True, "tooltip": "Только последовательный режим: зафиксировать перекрытие на готовом предыдущем окне (x0 = готовый результат, без перерисовки). Выкл — перекрытие перерисовывается заново, склейка без смешивания."}),
+                "seq_ref_phrase": ("STRING", {"multiline": True, "default": DEFAULT_SEQ_PHRASE, "tooltip": "Только последовательный режим, окна 2+: фраза, дописываемая к промпту новой строкой. {n} заменяется номером картинки с последним кадром предыдущего окна. Пусто — дописывается просто <Picture N>."}),
                 # --- согласованность
                 "alternate_direction": ("BOOLEAN", {"default": True, "tooltip": "Чередовать порядок окон по шагам: 1→N, затем N→1."}),
                 "temporal_guide": ("BOOLEAN", {"default": True, "tooltip": "Передавать окну кадр соседа из зоны перекрытия как keyframe H3."}),
@@ -405,7 +437,7 @@ class H3WindowedLatentRefine:
                 "ref_4": ("IMAGE", {"tooltip": "Любой доп. референс (предмет, стиль…), батч допустим."}),
                 "ref_5": ("IMAGE", {"tooltip": "Любой доп. референс, батч допустим."}),
                 "ref_6": ("IMAGE", {"tooltip": "Любой доп. референс, батч допустим. Всего не больше 9 картинок."}),
-                "prev_clip": ("IMAGE", {"tooltip": "Готовый клип прошлого прохода (например, предыдущего куска ролика). Берётся последний кадр и добавляется последним референсом <Picture N> (номер — в таблице референсов). Работает в обоих режимах; в последовательном это главный способ задать старт первому окну."}),
+                "positive": ("CONDITIONING", {"tooltip": "Только последовательный режим: готовый positive прошлой генерации для окна 1 (как есть, промпт и референсы ноды для окна 1 не кодируются). Окна 2+ всегда кодируются заново."}),
                 "anchor_latent": ("LATENT", {"tooltip": "Исходный низкоразрешённый латент H3: якорь и источник аудио."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -423,7 +455,7 @@ class H3WindowedLatentRefine:
             temporal_guide, guide_from_step, anchor_strength, anchor_steps, decode, verbose=True,
             character_ref=None, location_ref=None, anchor_latent=None, unique_id=None,
             location_ref_2=None, location_ref_3=None, ref_4=None, ref_5=None, ref_6=None, preview_frames=0,
-            window_mode=MODE_STEP, prev_clip=None):
+            window_mode=MODE_STEP, positive=None, seq_lock_overlap=True, seq_ref_phrase=DEFAULT_SEQ_PHRASE):
         del preview_frames  # UI-only
         import latent_preview
         video, audio, src = split_av(latent, anchor_audio(anchor_latent))
@@ -435,8 +467,10 @@ class H3WindowedLatentRefine:
         width, height = video.shape[4] * 16, video.shape[3] * 16
         refs, mapping = collect_refs({"character_ref": character_ref, "location_ref": location_ref,
                                       "location_ref_2": location_ref_2, "location_ref_3": location_ref_3,
-                                      "ref_4": ref_4, "ref_5": ref_5, "ref_6": ref_6,
-                                      "prev_clip": prev_clip[-1:] if prev_clip is not None else None})
+                                      "ref_4": ref_4, "ref_5": ref_5, "ref_6": ref_6})
+        seq = window_mode == MODE_SEQ
+        if seq and len(refs) >= MAX_REF_IMAGES:
+            raise ValueError(f"sequential mode adds the previous window's last frame as a reference: use at most {MAX_REF_IMAGES - 1} reference images (got {len(refs)})")
         notify = make_notifier(unique_id)
         lines = mapping_lines(mapping)
         if verbose:
@@ -445,14 +479,34 @@ class H3WindowedLatentRefine:
                 print("[H3WR]   " + l, flush=True)
         if notify:
             notify("refs", {"map": lines})
-        positive = encode_ref2va(clip, vae, prompt, refs, width, height)
+        ready_positive = positive if seq else None
+        positive = ready_positive if ready_positive is not None else encode_ref2va(clip, vae, prompt, refs, width, height)
         negative = encode_ref2va(clip, vae, negative_prompt, refs, width, height)
+        window_conds = None
+        if seq:
+            n_prev = len(refs) + 1
+
+            def window_conds(wi, finished, prev):
+                if prev is None:
+                    return None
+                frame = last_frame_image(vae, finished, prev)
+                refs_w = refs + [frame]
+                p = seq_prompt(prompt, seq_ref_phrase, n_prev)
+                if verbose:
+                    print(f"[H3WR] window {wi + 1}: re-encode, <Picture {n_prev}> = last frame of window {wi}; prompt tail: {p[len(prompt):].strip()!r}", flush=True)
+                if notify:
+                    notify("refs", {"map": lines + [f"<Picture {n_prev}> = последний кадр окна {wi} (для окна {wi + 1})"]})
+                return (encode_ref2va(clip, vae, p, refs_w, width, height),
+                        encode_ref2va(clip, vae, negative_prompt, refs_w, width, height))
+            if verbose and ready_positive is not None:
+                print("[H3WR] window 1: using connected positive conditioning as-is", flush=True)
         cb = latent_preview.prepare_callback(model, steps)
         out = run_windowed(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler, denoise,
                            num_windows, window_blocks, overlap_blocks, alternate_direction, temporal_guide, guide_from_step,
                            anchor_latent, anchor_strength, anchor_steps, shift_video, shift_audio, callback=cb,
                            verbose=verbose, audio_src=src, refs_count=len(refs),
-                           notify=notify, window_mode=window_mode)
+                           notify=notify, window_mode=window_mode, window_conds=window_conds,
+                           seq_lock_overlap=seq_lock_overlap)
         if decode:
             v = out["samples"].tensors[0] if getattr(out["samples"], "is_nested", False) else out["samples"]
             img = vae.decode(v)
