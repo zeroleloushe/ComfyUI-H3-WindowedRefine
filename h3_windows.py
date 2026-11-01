@@ -126,10 +126,23 @@ def window_keyframes(base_keyframes, win):
     return out
 
 
+def pad_to_patch(lat, patch=(2, 2)):
+    """Pad H/W of a [B,C,T,H,W] latent up to the model's patch size, exactly like the model does for the
+    target latent (comfy.ldm.common_dit.pad_to_patch_size, circular). The model pads only the target video;
+    condition latents (keyframes) go through patchify_video unpadded, so with an odd latent size
+    (e.g. 97x75 = 1552x1200 px) a keyframe sliced from the target would not match the padded grid."""
+    ph, pw = patch
+    dh, dw = (-lat.shape[-2]) % ph, (-lat.shape[-1]) % pw
+    if not (dh or dw):
+        return lat
+    return torch.nn.functional.pad(lat, (0, dw, 0, dh, 0, 0), mode="circular")
+
+
 def build_window_payload(payload, win, extra_keyframes):
     """Per-window copy of the H3 payload (see model_base.MiniMaxH3.extra_conds for the key order)."""
     p = {k: v for k, v in payload.items() if k not in ("layout", "keyframes", "cond_video_latents", "cond_audio_latents")}
     kfs = window_keyframes(payload.get("keyframes"), win) + list(extra_keyframes)
+    kfs = [dict(kf, latent=pad_to_patch(kf["latent"])) if kf.get("latent") is not None else kf for kf in kfs]
     cond_v, cond_a = [], []
     if kfs:
         p["keyframes"] = kfs

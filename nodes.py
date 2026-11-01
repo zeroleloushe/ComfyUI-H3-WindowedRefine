@@ -217,16 +217,44 @@ def make_notifier(node_id):
     return notify
 
 
+def check_sigmas(sigmas):
+    """Wired SIGMAS: 1-D, >= 2 values, finite. Returns the number of steps (len - 1)."""
+    if sigmas is None:
+        return None
+    if not torch.is_tensor(sigmas) or sigmas.ndim != 1 or sigmas.numel() < 2 or not bool(torch.isfinite(sigmas).all()):
+        raise ValueError("sigmas: expected a 1-D SIGMAS tensor with >= 2 finite values, got %s" % describe(sigmas))
+    return int(sigmas.numel()) - 1
+
+
+def sample_pass(m, noise, steps, cfg, sampler_name, scheduler, pos, neg, latent, denoise, seed, callback=None,
+                disable_pbar=True, sampler=None, sigmas=None):
+    """comfy.sample.sample as before; with a wired SAMPLER and/or SIGMAS it goes through sample_custom
+    (wired values win; the missing half comes from sampler_name / scheduler+denoise)."""
+    if sampler is None and sigmas is None:
+        return comfy.sample.sample(m, noise, steps, cfg, sampler_name, scheduler, pos, neg, latent, denoise=denoise,
+                                   callback=callback, disable_pbar=disable_pbar, seed=seed)
+    if sigmas is None:
+        sigmas = comfy.samplers.KSampler(m, steps=steps, device="cpu", sampler=sampler_name, scheduler=scheduler,
+                                         denoise=denoise, model_options=m.model_options).sigmas
+    if sampler is None:
+        sampler = comfy.samplers.sampler_object(sampler_name)
+    return comfy.sample.sample_custom(m, noise, cfg, sampler, sigmas, pos, neg, latent, callback=callback,
+                                      disable_pbar=disable_pbar, seed=seed)
+
+
 def run_windowed(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler, denoise,
                  num_windows, window_blocks, overlap_blocks, alternate, temporal_guide, guide_from_step,
                  anchor_latent=None, anchor_strength=0.0, anchor_steps_frac=0.0,
                  shift_video=0.0, shift_audio=3.0, callback=None, log=None, verbose=True, audio_src="input", refs_count=0, emit=None, notify=None,
-                 window_mode=MODE_STEP, window_conds=None, seq_lock_overlap=True):
+                 window_mode=MODE_STEP, window_conds=None, seq_lock_overlap=True, sampler=None, sigmas=None):
+    n_sig = check_sigmas(sigmas)
+    if n_sig:
+        steps = n_sig  # wired sigmas set the step count
     if window_mode == MODE_SEQ:
         return run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler, denoise,
                               num_windows, window_blocks, overlap_blocks, temporal_guide, anchor_latent, anchor_strength,
                               anchor_steps_frac, shift_video, shift_audio, log, verbose, audio_src, refs_count, emit, notify,
-                              window_conds, seq_lock_overlap)
+                              window_conds, seq_lock_overlap, sampler, sigmas)
     if window_mode != MODE_STEP:
         raise ValueError(f"window_mode: unknown {window_mode!r}, expected one of {WINDOW_MODES}")
     video, audio, _ = split_av(latent, anchor_audio(anchor_latent))
@@ -255,8 +283,7 @@ def run_windowed(model, positive, negative, latent, seed, steps, cfg, sampler_na
     reporter = Reporter(verbose, steps, len(wins), pbar, comfy.model_management.throw_exception_if_processing_interrupted, cuda_peak, emit, notify)
     wrapper.reporter = reporter
     try:
-        ks = comfy.samplers.KSampler(model, steps=steps, device="cpu", sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options)
-        sig = ks.sigmas.tolist()
+        sig = sigmas.tolist() if sigmas is not None else comfy.samplers.KSampler(model, steps=steps, device="cpu", sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options).sigmas.tolist()
     except Exception as e:
         sig = []
     reporter.summary(video, audio, audio_src, wins, refs_count, steps, denoise, sig, cfg, sampler_name, scheduler,
@@ -265,8 +292,8 @@ def run_windowed(model, positive, negative, latent, seed, steps, cfg, sampler_na
                      f"strength {anchor_strength}, {wrapper.anchor_steps} step(s) ({anchor_steps_frac} of {steps}), source {'anchor_latent' if anchor_latent is not None else 'input latent'}")
     model.set_model_unet_function_wrapper(wrapper)
     noise = comfy.sample.prepare_noise(samples, seed)
-    out = comfy.sample.sample(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, samples,
-                              denoise=denoise, callback=callback, disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed)
+    out = sample_pass(model, noise, steps, cfg, sampler_name, scheduler, positive, negative, samples, denoise, seed,
+                      callback=callback, disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, sampler=sampler, sigmas=sigmas)
     reporter.finish()
     res = latent.copy()
     res["samples"] = out
@@ -276,7 +303,7 @@ def run_windowed(model, positive, negative, latent, seed, steps, cfg, sampler_na
 def run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_name, scheduler, denoise,
                    num_windows, window_blocks, overlap_blocks, temporal_guide=True, anchor_latent=None, anchor_strength=0.0,
                    anchor_steps_frac=0.0, shift_video=0.0, shift_audio=3.0, log=None, verbose=True, audio_src="input",
-                   refs_count=0, emit=None, notify=None, window_conds=None, seq_lock_overlap=True):
+                   refs_count=0, emit=None, notify=None, window_conds=None, seq_lock_overlap=True, sampler=None, sigmas=None):
     """Window-major sampling: window 1 runs all steps, then window 2, ... Each next window gets the finished
     overlap of the previous one as H3 keyframes (latent, no VAE) and (seq_lock_overlap) its x0 in the overlap is locked.
     window_conds(wi, finished_video, prev_window) -> (positive, negative) or None re-encodes conditioning per window
@@ -304,8 +331,7 @@ def run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_
     rep = Reporter(verbose, steps, len(wins), pbar, comfy.model_management.throw_exception_if_processing_interrupted,
                    cuda_peak, emit, notify, sequential=True)
     try:
-        ks = comfy.samplers.KSampler(model, steps=steps, device="cpu", sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options)
-        sig = ks.sigmas.tolist()
+        sig = sigmas.tolist() if sigmas is not None else comfy.samplers.KSampler(model, steps=steps, device="cpu", sampler=sampler_name, scheduler=scheduler, denoise=denoise, model_options=model.model_options).sigmas.tolist()
     except Exception:
         sig = []
     rep.summary(video, audio, audio_src, wins, refs_count, steps, denoise, sig, cfg, sampler_name, scheduler,
@@ -363,8 +389,8 @@ def run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_
         m.set_model_unet_function_wrapper(wrapper)
         sub = comfy.nested_tensor.NestedTensor((sub_v, sub_a))
         sub_noise = comfy.nested_tensor.NestedTensor((nv[:, :, w.v0:w.v1], na[..., w.a0:w.a1]))
-        res = comfy.sample.sample(m, sub_noise, steps, cfg, sampler_name, scheduler, pos_w, neg_w, sub,
-                                  denoise=denoise, disable_pbar=True, seed=seed)
+        res = sample_pass(m, sub_noise, steps, cfg, sampler_name, scheduler, pos_w, neg_w, sub, denoise, seed,
+                          disable_pbar=True, sampler=sampler, sigmas=sigmas)
         rv, ra = res.unbind()
         out_v[:, :, w.v0 + ov_v:w.v1] = rv[:, :, ov_v:].to(out_v.dtype)
         out_a[..., w.a0 + ov_a:w.a1] = ra[..., ov_a:].to(out_a.dtype)
@@ -439,6 +465,8 @@ class H3WindowedLatentRefine:
                 "ref_6": ("IMAGE", {"tooltip": "Любой доп. референс, батч допустим. Всего не больше 9 картинок."}),
                 "positive": ("CONDITIONING", {"tooltip": "Только последовательный режим: готовый positive прошлой генерации для окна 1 (как есть, промпт и референсы ноды для окна 1 не кодируются). Окна 2+ всегда кодируются заново."}),
                 "anchor_latent": ("LATENT", {"tooltip": "Исходный низкоразрешённый латент H3: якорь и источник аудио."}),
+                "sampler": ("SAMPLER", {"tooltip": "Свой сэмплер (например KSamplerSelect). Если подключён — приоритетнее sampler_name."}),
+                "sigmas": ("SIGMAS", {"tooltip": "Свои сигмы. Если подключены — приоритетнее scheduler / steps / denoise: число шагов = длина − 1, для рефайна давай частичное расписание (например 0.8 → 0)."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -455,8 +483,17 @@ class H3WindowedLatentRefine:
             temporal_guide, guide_from_step, anchor_strength, anchor_steps, decode, verbose=True,
             character_ref=None, location_ref=None, anchor_latent=None, unique_id=None,
             location_ref_2=None, location_ref_3=None, ref_4=None, ref_5=None, ref_6=None, preview_frames=0,
-            window_mode=MODE_STEP, positive=None, seq_lock_overlap=True, seq_ref_phrase=DEFAULT_SEQ_PHRASE):
+            window_mode=MODE_STEP, positive=None, seq_lock_overlap=True, seq_ref_phrase=DEFAULT_SEQ_PHRASE,
+            sampler=None, sigmas=None):
         del preview_frames  # UI-only
+        n_sig = check_sigmas(sigmas)
+        if n_sig:
+            steps = n_sig
+            if verbose:
+                print("[H3WR] wired sigmas: %d steps %s%s" % (n_sig, [round(float(x), 4) for x in sigmas.tolist()],
+                                                              " + wired sampler" if sampler is not None else ""), flush=True)
+        elif sampler is not None and verbose:
+            print("[H3WR] wired sampler (sigmas from scheduler/denoise)", flush=True)
         import latent_preview
         video, audio, src = split_av(latent, anchor_audio(anchor_latent))
         if verbose:
@@ -506,7 +543,7 @@ class H3WindowedLatentRefine:
                            anchor_latent, anchor_strength, anchor_steps, shift_video, shift_audio, callback=cb,
                            verbose=verbose, audio_src=src, refs_count=len(refs),
                            notify=notify, window_mode=window_mode, window_conds=window_conds,
-                           seq_lock_overlap=seq_lock_overlap)
+                           seq_lock_overlap=seq_lock_overlap, sampler=sampler, sigmas=sigmas)
         if decode:
             v = out["samples"].tensors[0] if getattr(out["samples"], "is_nested", False) else out["samples"]
             img = vae.decode(v)
