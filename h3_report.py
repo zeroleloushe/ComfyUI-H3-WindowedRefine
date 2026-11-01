@@ -65,7 +65,8 @@ class Reporter:
                 shift, guide, anchor):
         T = video.shape[2]
         self.send("summary", T=int(T), frames=int(frames_for_latent_t(T)), steps=int(steps), seq=bool(self.sequential),
-                  windows=[[int(w.v0), int(w.v1)] for w in wins])
+                  windows=[[int(w.v0), int(w.v1)] for w in wins], sigmas=[round(float(x), 4) for x in sigmas],
+                  total=int(steps) * len(wins))
         if not self.verbose:
             return
         frames = frames_for_latent_t(T)
@@ -107,7 +108,8 @@ class Reporter:
         el = time.perf_counter() - self.t0
         frac = (step * self.num_windows + pos + 1) / (self.total_steps * self.num_windows)
         self.send("window", step=int(step), steps=self.total_steps, pos=int(pos), window=int(wi), tag=tag,
-                  v0=int(w.v0), v1=int(w.v1), elapsed=el, eta=el / max(frac, 1e-6) * (1 - frac) if frac <= 1 else 0.0)
+                  v0=int(w.v0), v1=int(w.v1), elapsed=el, eta=el / max(frac, 1e-6) * (1 - frac) if frac <= 1 else 0.0,
+                  done=int(step * self.num_windows + pos + 1), total=int(self.total_steps * self.num_windows))
         if self.pbar is not None:
             try:
                 self.pbar.update_absolute(min(self.total_steps * self.num_windows, step * self.num_windows + pos + 1),
@@ -160,7 +162,7 @@ class Reporter:
         self.send("step", step=int(step), steps=self.total_steps, sigma=float(sigma), order=[int(wi)], guide=wi > 0,
                   anchor=float(anchor_k), seq=True)
         self.send("window", step=int(step), steps=self.total_steps, pos=int(wi), window=int(wi), tag=tag, seq=True,
-                  elapsed=el, eta=eta)
+                  elapsed=el, eta=eta if done else None, done=int(done + 1), total=int(total))
         if self.pbar is not None:
             try:
                 self.pbar.update_absolute(min(total, done + 1), total)

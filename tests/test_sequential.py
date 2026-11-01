@@ -175,3 +175,20 @@ def test_sequential_odd_latent_size_keyframes(patcher):
     out = run_windowed(patcher, *conds(), lat, 0, 2, 1.0, "euler", "simple", 0.5, num_windows=2, window_blocks=0,
                        overlap_blocks=1, alternate=False, temporal_guide=True, guide_from_step=1, window_mode=MODE_SEQ)
     assert out["samples"].tensors[0].shape[-2:] == (3, 3)
+
+
+@pytest.mark.parametrize("mode", [MODE_STEP, MODE_SEQ])
+def test_progress_events_count_windows_and_wired_sigmas(patcher, mode):
+    ev = []
+    sig = torch.tensor([0.8, 0.5, 0.2, 0.0])
+    run_windowed(patcher, *conds(), {"samples": av_latent(124)}, 0, 7, 1.0, "euler", "simple", 0.3, num_windows=2,
+                 window_blocks=0, overlap_blocks=1, alternate=False, temporal_guide=True, guide_from_step=1,
+                 window_mode=mode, sigmas=sig, notify=lambda e, d: ev.append((e, d)))
+    summ = next(d for e, d in ev if e == "summary")
+    assert summ["steps"] == 3 and summ["total"] == 6 and len(summ["windows"]) == 2
+    assert summ["sigmas"] == [0.8, 0.5, 0.2, 0.0]
+    wins = [d for e, d in ev if e == "window"]
+    assert [d["done"] for d in wins][-1] == 6 and all(d["total"] == 6 for d in wins)
+    assert [d["done"] for d in wins] == sorted(d["done"] for d in wins)
+    if mode == MODE_SEQ:
+        assert wins[0]["eta"] is None and wins[1]["eta"] is not None   # no ETA before the first step is done
