@@ -138,3 +138,57 @@ def test_sequential_reencodes_each_window(patcher, lock):
                        verbose=False, log=log, window_mode=MODE_SEQ, window_conds=window_conds, seq_lock_overlap=lock)
     assert [c[:2] for c in calls] == [(0, False), (1, True), (2, True)]
     assert torch.isfinite(out["samples"].unbind()[0]).all()
+
+
+@pytest.mark.parametrize("mode", [MODE_STEP, MODE_SEQ])
+def test_wired_sigmas_and_sampler(patcher, monkeypatch, mode):
+    import comfy.samplers
+    seen = []
+    real = comfy.sample.sample_custom
+
+    def spy(model, noise, cfg, sampler, sigmas, *a, **k):
+        seen.append((sampler, [round(float(x), 4) for x in sigmas.tolist()]))
+        return real(model, noise, cfg, sampler, sigmas, *a, **k)
+    monkeypatch.setattr(comfy.sample, "sample_custom", spy)
+    monkeypatch.setattr(comfy.sample, "sample", lambda *a, **k: pytest.fail("plain sample used"))
+    smp = comfy.samplers.ksampler("lcm")
+    sig = torch.tensor([0.8, 0.5, 0.2, 0.0])
+    log = []
+    run_windowed(patcher, *conds(), {"samples": av_latent(124)}, 0, 7, 1.0, "euler", "simple", 0.3, num_windows=2,
+                 window_blocks=0, overlap_blocks=1, alternate=False, temporal_guide=True, guide_from_step=1,
+                 window_mode=mode, sampler=smp, sigmas=sig, log=log)
+    assert seen and all(s is smp and v == [0.8, 0.5, 0.2, 0.0] for s, v in seen)
+    assert len(seen) == (2 if mode == MODE_SEQ else 1)
+
+
+def test_bad_sigmas_rejected():
+    from h3wr.nodes import check_sigmas
+    for bad in (torch.tensor([1.0]), torch.tensor([1.0, float("nan")]), torch.zeros(2, 2)):
+        with pytest.raises(ValueError, match="sigmas"):
+            check_sigmas(bad)
+    assert check_sigmas(None) is None and check_sigmas(torch.tensor([1.0, 0.0])) == 1
+
+
+def test_sequential_odd_latent_size_keyframes(patcher):
+    """Odd latent H/W (e.g. 97x75): the model pads the target but not the keyframes -> window 2 used to crash."""
+    lat = {"samples": av_latent(124, 3, 3)}
+    out = run_windowed(patcher, *conds(), lat, 0, 2, 1.0, "euler", "simple", 0.5, num_windows=2, window_blocks=0,
+                       overlap_blocks=1, alternate=False, temporal_guide=True, guide_from_step=1, window_mode=MODE_SEQ)
+    assert out["samples"].tensors[0].shape[-2:] == (3, 3)
+
+
+@pytest.mark.parametrize("mode", [MODE_STEP, MODE_SEQ])
+def test_progress_events_count_windows_and_wired_sigmas(patcher, mode):
+    ev = []
+    sig = torch.tensor([0.8, 0.5, 0.2, 0.0])
+    run_windowed(patcher, *conds(), {"samples": av_latent(124)}, 0, 7, 1.0, "euler", "simple", 0.3, num_windows=2,
+                 window_blocks=0, overlap_blocks=1, alternate=False, temporal_guide=True, guide_from_step=1,
+                 window_mode=mode, sigmas=sig, notify=lambda e, d: ev.append((e, d)))
+    summ = next(d for e, d in ev if e == "summary")
+    assert summ["steps"] == 3 and summ["total"] == 6 and len(summ["windows"]) == 2
+    assert summ["sigmas"] == [0.8, 0.5, 0.2, 0.0]
+    wins = [d for e, d in ev if e == "window"]
+    assert [d["done"] for d in wins][-1] == 6 and all(d["total"] == 6 for d in wins)
+    assert [d["done"] for d in wins] == sorted(d["done"] for d in wins)
+    if mode == MODE_SEQ:
+        assert wins[0]["eta"] is None and wins[1]["eta"] is not None   # no ETA before the first step is done

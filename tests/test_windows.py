@@ -121,3 +121,15 @@ def test_anchor_blend():
             "c": {"latent_shapes": shapes, "minimax_payload": {}, "transformer_options": {"sample_sigmas": sig}}})
     ov, oa = unpack(out, shapes)
     assert torch.allclose(ov, torch.full_like(ov, 0.5)) and torch.equal(oa, a)
+
+
+def test_odd_latent_keyframes_are_padded_to_patch_grid():
+    import torch
+    from h3wr.h3_windows import pad_to_patch
+    odd = torch.randn(1, 24, 1, 97, 75)
+    out = pad_to_patch(odd)
+    assert out.shape == (1, 24, 1, 98, 76) and torch.equal(out[..., :97, :75], odd)
+    even = torch.randn(1, 24, 1, 96, 74)
+    assert pad_to_patch(even) is even
+    p = build_window_payload({"keyframes": []}, Window(0, 7, 0, 10), [{"resolved_frame_index": 0, "latent": odd}])
+    assert p["cond_video_latents"][0].shape[-2:] == (98, 76)

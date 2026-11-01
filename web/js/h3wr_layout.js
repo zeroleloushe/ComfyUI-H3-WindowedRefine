@@ -47,6 +47,15 @@ export function planWindows(T, nw, wb, ob) {
   return { windows: w };
 }
 
+// rows of the panel from a list of [v0, v1) windows (also used for the windows the node REALLY ran with)
+export function rowsFor(windows, fps = 24) {
+  return windows.map(([a, b], i) => {
+    const f0 = framesFor(a), f1 = framesFor(b) - 1;
+    const ov = i > 0 ? Math.max(0, windows[i - 1][1] - a) : 0;
+    return { i: i + 1, v0: a, v1: b, len: b - a, f0, f1, s0: f0 / fps, s1: (f1 + 1) / fps, ov };
+  });
+}
+
 // human-readable layout for the panel
 export function describeLayout(frames, nw, wb, ob, fps = 24) {
   const nv = nearestValidFrames(frames);
@@ -55,11 +64,7 @@ export function describeLayout(frames, nw, wb, ob, fps = 24) {
   const out = { frames, used, nv, T, error: r.error || null, rows: [], warnings: [] };
   if (!nv.valid) out.warnings.push(`${frames} кадров не 17k+5: ближайшие ${nv.lower} / ${nv.higher}, взято ${used}`);
   if (r.error) return out;
-  r.windows.forEach(([a, b], i) => {
-    const f0 = framesFor(a), f1 = framesFor(b) - 1;
-    const ov = i > 0 ? r.windows[i - 1][1] - a : 0;
-    out.rows.push({ i: i + 1, v0: a, v1: b, len: b - a, f0, f1, s0: f0 / fps, s1: (f1 + 1) / fps, ov });
-  });
+  out.rows = rowsFor(r.windows, fps);
   if (r.windows.length > 1 && r.windows.some(([a, b]) => b - a < MIN_TRAINED_T))
     out.warnings.push(`окно короче T=${MIN_TRAINED_T} (124 кадра) — вне обучающего диапазона H3`);
   return out;
