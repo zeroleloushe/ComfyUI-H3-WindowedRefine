@@ -72,9 +72,51 @@ function drawSections(node, ctx) {
   });
 }
 
+// ---- frame count from the graph: the "Рассчитать окна" button asks the nodes wired to this one
+const FRAME_WIDGETS = ["frames", "num_frames", "length", "video_length", "frame_count", "frame_rate_frames"];
+function linkOrigin(node, inputName) {
+  const inp = node.inputs?.find((x) => x.name === inputName);
+  if (!inp || inp.link == null) return null;
+  const g = app.graph, l = g?.links?.[inp.link] ?? g?.links?.get?.(inp.link);
+  return l ? g.getNodeById?.(l.origin_id) ?? null : null;
+}
+function numberOf(n) {
+  const ws = (n.widgets || []).filter((w) => typeof w.value === "number");
+  const w = ws.find((x) => x.name === "value") || ws[0];
+  return w ? Math.floor(w.value) : null;
+}
+// returns {frames, from} or null. 1) preview_frames wired to a number/primitive node; 2) walk up from `latent`
+// and take the first node with a frame-count widget (length / frames / num_frames ...)
+function frameCountFromGraph(node) {
+  let o = linkOrigin(node, "preview_frames");
+  for (let hop = 0; o && hop < 6; hop++) {
+    if (o.type === "Reroute") { const nx = o.inputs?.[0]?.link != null ? linkOrigin(o, o.inputs[0].name) : null; if (!nx) break; o = nx; continue; }
+    const n = numberOf(o);
+    if (n && n > 0) return { frames: n, from: `вход preview_frames ← ${o.title || o.type}` };
+    break;
+  }
+  const seen = new Set();
+  let cur = linkOrigin(node, "latent");
+  for (let hop = 0; cur && hop < 8 && !seen.has(cur.id); hop++) {
+    seen.add(cur.id);
+    const w = (cur.widgets || []).find((x) => FRAME_WIDGETS.includes(x.name) && typeof x.value === "number" && x.value > 0);
+    if (w) return { frames: Math.floor(w.value), from: `latent ← ${cur.title || cur.type}.${w.name}` };
+    const up = (cur.inputs || []).find((i) => i.link != null && /LATENT|IMAGE/.test(String(i.type)));
+    cur = up ? linkOrigin(cur, up.name) : null;
+  }
+  return null;
+}
+
 function layoutFor(node) {
+  const L = layoutCore(node), st = node.h3wr || {};
+  if (st.resolveNote && st.state !== "run") L.warnings = L.warnings.concat([st.resolveNote]);
+  return L;
+}
+
+function layoutCore(node) {
   const st = node.h3wr || {};
-  const pf = val(node, "preview_frames", 0) | 0;
+  const rs = st.resolved && st.state !== "run" ? st.resolved : null;
+  const pf = val(node, "preview_frames", 0) | 0 || (rs ? rs.frames : 0);
   const frames = pf > 0 ? pf : (st.T ? framesFor(st.T) : 124);
   if (pf <= 0 && st.state === "run" && st.windows && st.T) {
     // while sampling the chart shows the windows the node REALLY runs with (not the widgets' current plan)
@@ -83,7 +125,7 @@ function layoutFor(node) {
     return { frames, used: frames, nv: { valid: true }, T: st.T, error: null, rows, warnings, src: "текущий запуск" };
   }
   const L = describeLayout(frames, val(node, "num_windows", 2), val(node, "window_blocks", 0), val(node, "overlap_blocks", 1));
-  L.src = pf > 0 ? "превью" : (st.T ? "план · T из последнего запуска" : "пример");
+  L.src = (val(node, "preview_frames", 0) | 0) > 0 ? "превью" : rs ? rs.from : (st.T ? "план · T из последнего запуска" : "пример");
   return L;
 }
 
@@ -111,6 +153,11 @@ function panelHeight(node) {
 function recompute(node, force) {
   try {
     const st = node.h3wr; if (!st) return;
+    if (force) {
+      const r = frameCountFromGraph(node);
+      st.resolved = r;
+      st.resolveNote = r ? null : "число кадров из входов не найдено — задай «кадров (превью)»";
+    }
     st.layout = layoutFor(node);
     const sz = node.computeSize?.();
     if (sz) node.setSize?.([Math.max(node.size[0], sz[0], 360), sz[1]]);
