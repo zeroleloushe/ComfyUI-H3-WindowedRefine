@@ -401,6 +401,58 @@ def run_sequential(model, positive, negative, latent, seed, steps, cfg, sampler_
     return res
 
 
+PLAN_TYPE = "H3_WINDOWS"
+
+
+class H3WindowPlanner:
+    """Separate window-layout node: plans the temporal windows (chart in the UI) and feeds the refine node."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "num_windows": ("INT", {"default": 2, "min": 0, "max": 64, "tooltip": "Число временных окон. 0 — длину задаёт «Длина окна»."}),
+                "window_blocks": ("INT", {"default": 0, "min": 0, "max": 200, "tooltip": "m: длина окна 5·m+2 латент-кадров (используется, если окон = 0)."}),
+                "overlap_blocks": ("INT", {"default": 2, "min": 0, "max": 100, "tooltip": "o: перекрытие не меньше 5·o+2 латент-кадров (1 → 7, 2 → 12)."}),
+                "preview_frames": ("INT", {"default": 0, "min": 0, "max": 3600, "step": 1,
+                                           "tooltip": "Только для графика в UI: число кадров ролика (ближайшее 17k+5). 0 — взять из входа latent / по кнопке «Рассчитать окна»."}),
+            },
+            "optional": {
+                "latent": ("LATENT", {"tooltip": "Необязательно: латент H3 только чтобы узнать длину. При запуске график и проверка окон берут T отсюда."}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = (PLAN_TYPE,)
+    RETURN_NAMES = ("windows",)
+    OUTPUT_TOOLTIPS = ("План окон: подключи к входу windows ноды Windowed Latent Refine (приоритетнее её собственных num_windows / window_blocks / overlap_blocks).",)
+    FUNCTION = "run"
+    CATEGORY = "MiniMax H3/Refine"
+    DESCRIPTION = "Планировщик окон для MiniMax H3 Windowed Latent Refine: график раскладки окон и перекрытий, число кадров берётся из входов."
+
+    def run(self, num_windows, window_blocks, overlap_blocks, preview_frames=0, latent=None, unique_id=None):
+        del preview_frames  # UI-only
+        plan = {"num_windows": int(num_windows), "window_blocks": int(window_blocks), "overlap_blocks": int(overlap_blocks)}
+        if latent is not None:
+            video, audio, _ = split_av(latent)
+            wins = plan_windows(video.shape[2], audio.shape[-1], **plan)  # validate early, like the refine node
+            plan["T"] = int(video.shape[2])
+            notify = make_notifier(unique_id)
+            if notify:
+                notify("plan", {"T": int(video.shape[2]), "frames": int(frames_for_latent_t(video.shape[2])), "windows": [[int(w.v0), int(w.v1)] for w in wins]})
+            print("[H3WR] planner: T=%d -> %d window(s) %s" % (video.shape[2], len(wins), [(w.v0, w.v1) for w in wins]), flush=True)
+        return (plan,)
+
+
+def apply_plan(plan, num_windows, window_blocks, overlap_blocks):
+    """A wired H3_WINDOWS plan wins over the node's own window widgets."""
+    if plan is None:
+        return num_windows, window_blocks, overlap_blocks
+    if not isinstance(plan, dict) or not {"num_windows", "window_blocks", "overlap_blocks"} <= set(plan):
+        raise ValueError("windows: expected the output of the H3 Window Planner node, got %s" % describe(plan))
+    return int(plan["num_windows"]), int(plan["window_blocks"]), int(plan["overlap_blocks"])
+
+
 class H3WindowedLatentRefine:
     """Group order matters: the web extension draws section headers from WIDGET_GROUPS."""
     WIDGET_GROUPS = [
@@ -465,6 +517,7 @@ class H3WindowedLatentRefine:
                 "ref_6": ("IMAGE", {"tooltip": "Любой доп. референс, батч допустим. Всего не больше 9 картинок."}),
                 "positive": ("CONDITIONING", {"tooltip": "Только последовательный режим: готовый positive прошлой генерации для окна 1 (как есть, промпт и референсы ноды для окна 1 не кодируются). Окна 2+ всегда кодируются заново."}),
                 "anchor_latent": ("LATENT", {"tooltip": "Исходный низкоразрешённый латент H3: якорь и источник аудио."}),
+                "windows": (PLAN_TYPE, {"tooltip": "План окон от ноды H3 Window Planner. Если подключён — приоритетнее num_windows / window_blocks / overlap_blocks этой ноды."}),
                 "sampler": ("SAMPLER", {"tooltip": "Свой сэмплер (например KSamplerSelect). Если подключён — приоритетнее sampler_name."}),
                 "sigmas": ("SIGMAS", {"tooltip": "Свои сигмы. Если подключены — приоритетнее scheduler / steps / denoise: число шагов = длина − 1, для рефайна давай частичное расписание (например 0.8 → 0)."}),
             },
@@ -484,8 +537,11 @@ class H3WindowedLatentRefine:
             character_ref=None, location_ref=None, anchor_latent=None, unique_id=None,
             location_ref_2=None, location_ref_3=None, ref_4=None, ref_5=None, ref_6=None, preview_frames=0,
             window_mode=MODE_STEP, positive=None, seq_lock_overlap=True, seq_ref_phrase=DEFAULT_SEQ_PHRASE,
-            sampler=None, sigmas=None):
+            sampler=None, sigmas=None, windows=None):
         del preview_frames  # UI-only
+        num_windows, window_blocks, overlap_blocks = apply_plan(windows, num_windows, window_blocks, overlap_blocks)
+        if windows is not None and verbose:
+            print("[H3WR] wired window plan: num_windows=%d window_blocks=%d overlap_blocks=%d" % (num_windows, window_blocks, overlap_blocks), flush=True)
         n_sig = check_sigmas(sigmas)
         if n_sig:
             steps = n_sig
@@ -553,5 +609,6 @@ class H3WindowedLatentRefine:
         return (out, img)
 
 
-NODE_CLASS_MAPPINGS = {"H3WindowedLatentRefine": H3WindowedLatentRefine}
-NODE_DISPLAY_NAME_MAPPINGS = {"H3WindowedLatentRefine": "MiniMax H3 · Windowed Latent Refine"}
+NODE_CLASS_MAPPINGS = {"H3WindowedLatentRefine": H3WindowedLatentRefine, "H3WindowPlanner": H3WindowPlanner}
+NODE_DISPLAY_NAME_MAPPINGS = {"H3WindowedLatentRefine": "MiniMax H3 · Windowed Latent Refine",
+                              "H3WindowPlanner": "MiniMax H3 · Window Planner"}

@@ -30,6 +30,10 @@ git clone https://github.com/zeroleloushe/ComfyUI-H3-WindowedRefine.git
 3. По желанию подключи картинки к `character_ref` / `location_ref` / `ref_*` и упомяни их в промте как `<Picture N>`.
 4. Выход `latent` (AV-латент) отправь в декодер H3. Можно включить `decode` и взять `images` прямо с ноды.
 
+### Отдельные входы и планировщик окон
+- `sampler` / `sigmas` (необязательно): свой сэмплер и свои сигмы, приоритетнее `sampler_name` / `scheduler` / `steps` / `denoise`. Число шагов = длина сигм − 1.
+- **MiniMax H3 · Window Planner** (отдельная нода, категория MiniMax H3/Refine): график раскладки окон и перекрытий. Выход `windows` подключается ко входу `windows` основной ноды и главнее её `num_windows` / `window_blocks` / `overlap_blocks`. Кнопка «Рассчитать окна» берёт число кадров из входа `preview_frames` (числовая нода) или идёт вверх от входа `latent` и ищет виджет `length` / `frames` / `num_frames`; если подключить `latent`, при запуске график берёт точное T из него.
+
 ## Параметры
 | Параметр | По умолчанию | Описание |
 |---|---|---|

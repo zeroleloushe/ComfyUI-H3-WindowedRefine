@@ -5,7 +5,7 @@ import { api } from "../../scripts/api.js";
 import { framesFor, latentFor, planWindows as planWindowsRaw, describeLayout, rowsFor, MIN_TRAINED_T } from "./h3wr_layout.js";
 const planWindows = (T, nw, wb, ob) => planWindowsRaw(T, nw, wb, ob).windows || null;
 
-const NODE = "H3WindowedLatentRefine";
+const NODE = "H3WindowedLatentRefine", PLANNER = "H3WindowPlanner";
 const EXTRA_H = 100;
 const THEME = { color: "#2b3a55", bgcolor: "#1b2333", accent: "#6aa9ff", win: ["#4c8dff", "#ff9f43", "#2ecc71", "#e056fd", "#f1c40f", "#00cec9"] };
 const GROUPS = [
@@ -124,22 +124,30 @@ function layoutCore(node) {
     if (rows.length > 1 && rows.some((r) => r.len < MIN_TRAINED_T)) warnings.push(`окно короче T=${MIN_TRAINED_T} (124 кадра) — вне обучающего диапазона H3`);
     return { frames, used: frames, nv: { valid: true }, T: st.T, error: null, rows, warnings, src: "текущий запуск" };
   }
-  const L = describeLayout(frames, val(node, "num_windows", 2), val(node, "window_blocks", 0), val(node, "overlap_blocks", 1));
+  const L = describeLayout(frames, param(node, "num_windows", 2), param(node, "window_blocks", 0), param(node, "overlap_blocks", 1));
   L.src = (val(node, "preview_frames", 0) | 0) > 0 ? "превью" : rs ? rs.from : (st.T ? "план · T из последнего запуска" : "пример");
   return L;
+}
+
+// window params: a wired Window Planner wins over this node's own widgets (same rule as in Python)
+function param(node, name, d) {
+  const o = linkOrigin(node, "windows");
+  const w = o?.widgets?.find((x) => x.name === name);
+  return w && w.value !== undefined ? w.value : val(node, name, d);
 }
 
 // grey out widgets that do nothing in the current setup (mode / wired sampler & sigmas)
 function linked(node, name) { const i = node.inputs?.find((x) => x.name === name); return !!(i && i.link != null); }
 function syncWidgets(node) {
   const seq = val(node, "window_mode", "") === "последовательный";
-  const sig = linked(node, "sigmas"), smp = linked(node, "sampler");
+  const sig = linked(node, "sigmas"), smp = linked(node, "sampler"), plan = linked(node, "windows");
   const off = { alternate_direction: seq, guide_from_step: seq, seq_lock_overlap: !seq, seq_ref_phrase: !seq,
-                steps: sig, scheduler: sig, denoise: sig, sampler_name: smp };
+                steps: sig, scheduler: sig, denoise: sig, sampler_name: smp,
+                num_windows: plan, window_blocks: plan, overlap_blocks: plan };
   for (const [name, dis] of Object.entries(off)) {
     const w = W(node, name); if (!w) continue;
     if (w.disabled !== dis) { w.disabled = dis; }
-    const base = LABELS[name] || name, want = dis ? base + (sig && ["steps", "scheduler", "denoise"].includes(name) ? " (из sigmas)" : smp && name === "sampler_name" ? " (из sampler)" : " (не исп.)") : base;
+    const base = LABELS[name] || name, want = dis ? base + (sig && ["steps", "scheduler", "denoise"].includes(name) ? " (из sigmas)" : smp && name === "sampler_name" ? " (из sampler)" : plan && name.endsWith("_windows") || plan && name.endsWith("_blocks") ? " (из планировщика)" : " (не исп.)") : base;
     if (w.label !== want) w.label = want;
   }
 }
@@ -234,7 +242,7 @@ function drawPanel(node, ctx, py, width) {
   ctx.fillStyle = "#c7d7ee";
   const rl = st.refs ? (st.refs.length ? st.refs.map((l) => l.replace(/^<Picture (\d+)> = /, "P$1=")).join("  ") : "референсов нет")
                      : "референсы: таблица <Picture N> появится после запуска";
-  ctx.fillText(fit(ctx, rl, wd), x0, yEnd - 24);
+  if (node.comfyClass !== PLANNER && node.type !== PLANNER) ctx.fillText(fit(ctx, rl, wd), x0, yEnd - 24);
   if (st.sig) {
     ctx.fillStyle = "#9fb3d1";
     const sg = st.sig.length > 8 ? st.sig.slice(0, 4).concat(["…"], st.sig.slice(-3)) : st.sig;
@@ -262,7 +270,7 @@ function drawPanel(node, ctx, py, width) {
 app.registerExtension({
   name: "h3wr.windowed_refine",
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData?.name !== NODE) return;
+    if (nodeData?.name !== NODE && nodeData?.name !== PLANNER) return;
     const onCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = onCreated?.apply(this, arguments);
@@ -284,6 +292,7 @@ app.registerExtension({
           const node = app.graph?.getNodeById?.(Number(d.node)) ?? app.graph?.getNodeById?.(d.node);
           if (!node?.h3wr) return;
           const st = node.h3wr;
+          if (d.event === "plan") { Object.assign(st, { T: d.T, frames: d.frames, resolved: { frames: d.frames, from: "latent на входе (последний запуск)" } }); node.setDirtyCanvas?.(true, true); return; }
           if (d.event === "refs") { st.refs = d.map || []; node.setDirtyCanvas?.(true, true); return; }
           if (d.event === "summary") setTimeout(() => recompute(node, false), 0);
           if (d.event === "summary") Object.assign(st, { T: d.T, frames: d.frames, steps: d.steps, seq: !!d.seq, state: "run", step: 0, win: -1, pos: 0,
